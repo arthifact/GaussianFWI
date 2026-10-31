@@ -27,7 +27,7 @@ survey = {
     "nt": 1000,             # samples per recording
     "source_frequency": 15.0,  # Ricker wavelet peak frequency, Hz
 }
-noise_db = 30               # 'None' for clean observations
+noise_db = 30               # None for clean observations
 noise_seed = 0
 gaussian_frequencies = (6, 9)  # Low-pass cutoffs, Hz
 pixel_frequencies = (13, 20, 30)
@@ -52,14 +52,14 @@ initial = (1500 + 1500 * depth / depth.max()).expand_as(true).clone()
 
 # Keep a snapshot after each Gaussian frequency.
 gaussians = GaussianField(initial, survey["dx"])
-gaussian_backgrounds = {}
+gaussian_backgrounds = []
 progress = []
 for frequency in gaussian_frequencies:
     started = perf_counter()
     losses = fit_gaussians(gaussians, problem, frequency, iterations=gaussian_iterations)
     seconds = perf_counter() - started
     snapshot = gaussians.velocity().clamp(*problem.bounds).detach().clone()
-    gaussian_backgrounds[frequency] = snapshot
+    gaussian_backgrounds.append((frequency, snapshot))
     error = snapshot - true
     progress.append({
         "stage": "gaussians", "frequency": frequency, "loss": losses,
@@ -97,11 +97,15 @@ settings = {
     "initial_velocity": [1500.0, 3000.0],
     "versions": {name: version(name) for name in ("torch", "deepwave", "numpy")},
 }
+if gaussian_backgrounds:
+    saved_backgrounds = torch.stack([background for _, background in gaussian_backgrounds])
+else:
+    saved_backgrounds = true.new_empty((0, *true.shape))
 np.savez_compressed(
     output / "result.npz",
     true=true.numpy(), final=final.numpy(),
     gaussian_frequencies=gaussian_frequencies,
-    gaussian_backgrounds=torch.stack(list(gaussian_backgrounds.values())).numpy(),
+    gaussian_backgrounds=saved_backgrounds.numpy(),
     settings=json.dumps(settings), progress=json.dumps(progress),
 )
 save_models(true, gaussian_backgrounds, final, output / "result.png")
