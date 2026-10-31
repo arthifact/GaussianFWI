@@ -2,7 +2,7 @@
 
 Gaussian background + plain pixel refinement using Deepwave.
 
-Place your original `.npy` models in `data/`; datasets are not included.
+The original `.npy` models are included in `data/`.
 
 Edit the settings at the top of `main.py` and press **Run**.
 Set `noise_db = None` for clean observations.
@@ -21,3 +21,8 @@ Each run saves a new folder with just two files:
   timings and errors.
 
 Our results go in `outputs/`; comparison results go in `comparisons/outputs/`.
+
+Data credits: BP (BP 2004), IFP (Marmousi), SEG/EAGE (Overthrust),
+SMAART (Sigsbee). SEAM Open Data © 2013 SEG Advanced Modeling Corporation
+([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)); its P-wave
+velocity slice was converted from SEG-Y to NumPy.
