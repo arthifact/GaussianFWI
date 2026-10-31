@@ -1,0 +1,10 @@
+[project]
+name = "gaussian-fwi"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "deepwave>=0.0.27",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "torch>=2.14.1",
+]
