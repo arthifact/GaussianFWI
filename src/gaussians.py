@@ -14,9 +14,10 @@ def gaussian(dz, dx, long, short, angle):
 
 
 class GaussianField:
-    """Each parameter row is [z, x, log(long), log(short), angle, amplitude].
+    """Each row is [z, x, log(width along angle), log(perpendicular width), angle, amplitude].
 
-    Widths use logarithms so they stay positive during optimization.
+    At birth the first axis is at least as wide as the second. The two
+    log widths are optimized independently, so their ordering can change.
     Grid shape, dtype and device come from the background.
     """
 
@@ -41,9 +42,13 @@ class GaussianField:
         shapes = gaussian(self.z - z, self.x - x, log_long.exp(), log_short.exp(), angle)
         return self.background + (amplitude * shapes).sum(0)
 
-    def add(self, z, x, long, short, angle, amp):
+    def params_with_gaussian(self, z, x, long, short, angle, amp):
+        """Return the parameter table a proposed addition would store."""
         row = self.params.new_tensor([[z, x, math.log(long), math.log(short), angle, amp]])
-        self.params = torch.cat((self.params, row))
+        return torch.cat((self.params, row))
+
+    def add(self, z, x, long, short, angle, amp):
+        self.params = self.params_with_gaussian(z, x, long, short, angle, amp)
 
     def keep(self, mask):
         self.params = self.params[mask]

@@ -1,7 +1,5 @@
 """A fixed background plus pixel corrections, fitted one frequency at a time."""
 
-import math
-
 import torch
 
 
@@ -16,8 +14,9 @@ class PixelField:
 
 def fit_pixels(model, problem, frequency, iterations=350):
     """Fit one frequency with fresh Adam state; return the loss before each update."""
-    if not math.isfinite(frequency) or frequency <= 0 or iterations < 0:
-        raise ValueError("frequency must be finite and positive, and iterations nonnegative")
+    problem.validate_cutoff(frequency)
+    if iterations < 0:
+        raise ValueError("iterations must be nonnegative")
     losses = []
     if iterations == 0:
         return losses
@@ -31,5 +30,5 @@ def fit_pixels(model, problem, frequency, iterations=350):
         optimizer.step()
         with torch.no_grad():
             model.details.clamp_(problem.bounds[0] - model.background, problem.bounds[1] - model.background)
-    print(f"Pixels: {frequency:g} Hz, loss {loss:.3e}")
+    print(f"Pixels: {frequency:g} Hz, last pre-update loss {loss:.3e}")
     return losses

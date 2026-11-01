@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 
 def _smooth(image, sigma):
     """Gaussian smoothing in pixels, applied horizontally then vertically."""
-    radius = min(int(3 * sigma), min(image.shape) - 1)
+    radius = int(min(3 * sigma, min(image.shape) - 1))
     if radius == 0:
         return image
     offsets = torch.arange(-radius, radius + 1, dtype=image.dtype, device=image.device)
@@ -72,6 +72,8 @@ class PixelFWI:
             raise ValueError("Use between 1 and nx surface shots and receivers")
         if not all(math.isfinite(v) and v > 0 for v in (self.dx, self.dt, self.source_frequency)) or self.nt < 2:
             raise ValueError("Spacing, time step and source frequency must be finite and positive; nt must be at least 2")
+        if self.source_frequency > 0.5 / self.dt:
+            raise ValueError("The source peak frequency must not exceed Nyquist")
         self.sources = torch.zeros(self.n_shots, 1, 2, dtype=torch.long)
         self.sources[:, 0, 1] = torch.linspace(0, nx - 1, self.n_shots).round().long()
         self.receivers = torch.zeros(1, n_receivers, 2, dtype=torch.long)
@@ -92,7 +94,7 @@ class PixelFWI:
     def _simulate(self, velocity, shot, accuracy=4):
         result = deepwave.scalar(
             velocity, self.dx, self.dt,
-            source_amplitudes=self.wavelet,
+            source_amplitudes=self.wavelet.to(velocity),
             source_locations=self.sources[shot:shot + 1],
             receiver_locations=self.receivers,
             accuracy=accuracy, pml_width=20, pml_freq=self.source_frequency, max_vel=self.bounds[1],
@@ -110,22 +112,35 @@ class PixelFWI:
 
     def add_noise(self, shots, snr_db, seed=0):
         """Add reproducible Gaussian noise with the source wavelet's spectrum."""
-        white = torch.randn(shots.shape, generator=torch.Generator().manual_seed(seed))
+        generator = torch.Generator(device=shots.device).manual_seed(seed)
+        white = torch.randn(shots.shape, dtype=shots.dtype, device=shots.device, generator=generator)
         n_fft = 2 * shots.shape[-1]
         white_spectrum = torch.fft.rfft(white, n_fft)
-        wavelet_spectrum = torch.fft.rfft(self.wavelet[0, 0], n_fft).abs()
+        wavelet_spectrum = torch.fft.rfft(self.wavelet[0, 0].to(shots), n_fft).abs()
         noise = torch.fft.irfft(white_spectrum * wavelet_spectrum, n_fft)
         noise = noise[..., :shots.shape[-1]]
         scaled_noise = noise * shots.norm() / noise.norm()
         return shots + scaled_noise / 10 ** (snr_db / 20)
 
+    def validate_cutoff(self, frequency):
+        nyquist = 0.5 / self.dt
+        if not math.isfinite(frequency) or not 0 < float(frequency) <= nyquist:
+            raise ValueError(
+                f"Invalid cutoff {frequency} Hz. The frequency must be finite and positive "
+                f"and no higher than Nyquist ({nyquist} Hz)."
+            )
+
     def _lowpass(self, recordings, frequency):
+        self.validate_cutoff(frequency)
+        frequency = float(frequency)
         n_fft = 2 * recordings.shape[-1]
-        frequencies = torch.fft.rfftfreq(n_fft, self.dt)
+        spectrum = torch.fft.rfft(recordings, n_fft)
+        frequencies = torch.fft.rfftfreq(n_fft, self.dt, dtype=spectrum.real.dtype, device=spectrum.device)
         # Fade smoothly from 70% of the cutoff to zero at the cutoff.
         rolloff = ((frequencies - 0.7 * frequency) / (0.3 * frequency)).clamp(0, 1)
         taper = torch.cos(0.5 * torch.pi * rolloff)**2
-        spectrum = torch.fft.rfft(recordings, n_fft)
+        taper[frequencies >= frequency] = 0.0
+        taper[0] = 1.0
         filtered = torch.fft.irfft(spectrum * taper, n_fft)
         return filtered[..., :recordings.shape[-1]]
 
@@ -152,8 +167,9 @@ class PixelFWI:
 
     def fit(self, frequency, iterations=340):
         """Fit one frequency with fresh Adam state; return the loss before each update."""
-        if not math.isfinite(frequency) or frequency <= 0 or iterations < 0:
-            raise ValueError("frequency must be finite and positive, and iterations nonnegative")
+        self.validate_cutoff(frequency)
+        if iterations < 0:
+            raise ValueError("iterations must be nonnegative")
         losses = []
         if iterations == 0:
             return losses
@@ -209,6 +225,8 @@ if __name__ == "__main__":
     depth = torch.arange(true.shape[0])[:, None] * survey["dx"]
     initial = (1500 + 1500 * depth / depth.max()).expand_as(true).clone()
     model = PixelFWI(initial, survey)
+    for frequency in frequencies:
+        model.validate_cutoff(frequency)
     observed = model.forward(true, accuracy=8)
     if noise_db is not None:
         observed = model.add_noise(observed, noise_db, noise_seed)

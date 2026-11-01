@@ -8,14 +8,22 @@ from .gaussians import gaussian
 
 
 class _Candidates:
-    """225 Gaussian shapes, scored at every grid cell using FFT correlations."""
+    """Gaussian shapes covering the stage's wavelength floor, scored using FFTs."""
 
-    def __init__(self, field):
+    def __init__(self, field, frequency, max_velocity):
         self.z, self.x, self.dx = field.z, field.x, field.dx
         self.nz, self.nx = field.background.shape
+        # Keep the original scales and extend them to cover every allowed velocity.
+        required_width = max_velocity / (4 * float(frequency))
+        widths = [field.dx * 2 ** (i / 2) for i in range(9)]
+        self.base_max_width = widths[-1]
+        max_short_width = torch.finfo(field.params.dtype).max / 4  # The longest aspect ratio is 4.
+        while widths[-1] < required_width and widths[-1] <= max_short_width:
+            widths.append(2 * widths[-2])  # Two half-octave steps double the width.
+        if not widths[-1] <= max_short_width:
+            raise ValueError("Required Gaussian widths exceed the field's numeric range at this cutoff or spacing")
         shapes = []
-        for width_index in range(9):
-            width = field.dx * 2 ** (width_index / 2)
+        for width in widths:
             for aspect_ratio in (1, 2, 4):
                 angles = range(12) if aspect_ratio > 1 else (0,)
                 for angle_index in angles:
@@ -44,10 +52,15 @@ class _Candidates:
     def propose(self, gradient, illumination, velocity, frequency, max_candidates=6):
         slope = self.correlate(gradient, self.spectra[0])
         curvature = self.correlate(illumination, self.spectra[1])
-        floor = (1e-12 * curvature.max()).clamp_min(torch.finfo(curvature.dtype).tiny)
+        extended = self.short > self.base_max_width
+        # Keep the numerical floor for original shapes independent of any wider shapes.
+        shape_peaks = curvature.amax(dim=(1, 2), keepdim=True)
+        peak = torch.where(extended, shape_peaks.max(), shape_peaks[~extended].max())
+        floor = (1e-12 * peak).clamp_min(torch.finfo(curvature.dtype).tiny)
         score = slope**2 / curvature.clamp_min(floor)
-        # Keep proposed widths at least a quarter of the local wavelength.
-        score[self.short < velocity / (4 * frequency)] = 0
+        min_width = velocity / (4 * frequency)
+        # Use extension widths only where no original short axis meets the wavelength floor.
+        score[(self.short < min_width) | (extended & (min_width <= self.base_max_width))] = 0
         best_score, best_shape = score.max(0)
         proposals = []
         for _ in range(max_candidates):
@@ -86,38 +99,61 @@ def _grow(field, problem, candidates, gradient, illumination, frequency, loss, t
     """
     velocity = field.velocity()
     lower, upper = problem.bounds
+    bounded_velocity = velocity.clamp(lower, upper)
+    relative_tolerance = 8 * torch.finfo(velocity.dtype).eps
     active = (velocity >= lower) & (velocity <= upper)
-    proposals = candidates.propose(gradient * active, illumination, velocity.clamp(lower, upper), frequency)
+    proposals = candidates.propose(gradient * active, illumination, bounded_velocity, frequency)
     for candidate in proposals:
         shape = gaussian(
             field.z - candidate["z"], field.x - candidate["x"],
             candidate["long"], candidate["short"], candidate["angle"],
         )
         iz, ix = round(candidate["z"] / field.dx), round(candidate["x"] / field.dx)
-        local_velocity = float(velocity[iz, ix].clamp(lower, upper))
+        local_velocity = float(bounded_velocity[iz, ix])
         active = (velocity >= lower) & (velocity <= upper)
         slope = float((gradient * shape * active).sum())
         trial = math.copysign(0.05 * local_velocity, -slope)
-        trial_loss = problem.loss((velocity + trial * shape).clamp(lower, upper), frequency)
+        # Rebuild the field exactly as stored, including log-width and summation rounding.
+        trial_params = field.params_with_gaussian(**candidate, amp=trial)
+        trial_velocity = field.velocity(trial_params)
+        bounded_trial = trial_velocity.clamp(lower, upper)
+        if torch.equal(bounded_trial, bounded_velocity):
+            continue
+        trial_loss = problem.loss(bounded_trial, frequency)
         curvature = 2 * (trial_loss - loss - trial * slope) / trial**2
-        amplitude = -slope / curvature if curvature > 0 else trial
-        amplitude = max(-0.3 * local_velocity, min(0.3 * local_velocity, amplitude))
-        new_loss = problem.loss((velocity + amplitude * shape).clamp(lower, upper), frequency)
-        if new_loss <= loss - threshold:
-            field.add(**candidate, amp=amplitude)
-            velocity, loss = velocity + amplitude * shape, new_loss
+        estimate = -slope / curvature if curvature > 0 else trial
+        estimate = max(-0.3 * local_velocity, min(0.3 * local_velocity, estimate))
+        # Prefer the estimate. If it fails, reuse the measured trial.
+        for amplitude in (estimate, trial):
+            if amplitude == trial:
+                proposed_params = trial_params
+                proposed_velocity, bounded_proposal, new_loss = trial_velocity, bounded_trial, trial_loss
+            else:
+                proposed_params = field.params_with_gaussian(**candidate, amp=amplitude)
+                proposed_velocity = field.velocity(proposed_params)
+                bounded_proposal = proposed_velocity.clamp(lower, upper)
+                if torch.equal(bounded_proposal, bounded_velocity):
+                    continue
+                new_loss = problem.loss(bounded_proposal, frequency)
+            improvement = loss - new_loss
+            # The gradient and forward checks sum losses in different orders.
+            roundoff = relative_tolerance * max(abs(loss), abs(new_loss))
+            if improvement > roundoff and improvement >= threshold:
+                field.params = proposed_params
+                velocity, bounded_velocity, loss = proposed_velocity, bounded_proposal, new_loss
+                break
 
 
-def fit_gaussians(field, problem, frequency, iterations=325):
+def fit_gaussians(field, problem, frequency, iterations=325, *, prune=True):
     """Fit one low-pass frequency and return the loss before each update."""
-    if not math.isfinite(frequency) or frequency <= 0 or iterations < 0:
-        raise ValueError("frequency must be finite and positive, and iterations nonnegative")
+    problem.validate_cutoff(frequency)
+    if iterations < 0:
+        raise ValueError("iterations must be nonnegative")
     losses = []
     if iterations == 0:
         return losses
     lower, upper = problem.bounds
-    candidates = _Candidates(field)
-    threshold = problem.birth_threshold(frequency)
+    candidates = _Candidates(field, frequency, upper)
     illumination = problem.illumination(field.velocity().clamp(lower, upper), frequency)
     adam = field.params.new_zeros((len(field), 3, 6))
     for iteration in range(iterations):
@@ -127,13 +163,15 @@ def fit_gaussians(field, problem, frequency, iterations=325):
         losses.append(loss)
         if iteration % 10 == 0:
             # Add useful Gaussians and remove weak ones, keeping their Adam rows aligned.
+            threshold = problem.birth_threshold(frequency)
             previous_count = len(field)
             _grow(field, problem, candidates, gradient, illumination, frequency, loss, threshold)
             new_state = adam.new_zeros((len(field) - previous_count, 3, 6))
             adam = torch.cat((adam, new_state))
-            keep = field.params[:, 5].abs() > 5.0
-            field.keep(keep)
-            adam = adam[keep]
+            if prune:
+                keep = field.params[:, 5].abs() > 5.0
+                field.keep(keep)
+                adam = adam[keep]
         else:
             # Backpropagate the velocity-grid gradient into the Gaussian parameters.
             velocity.backward(gradient)
@@ -142,5 +180,5 @@ def fit_gaussians(field, problem, frequency, iterations=325):
             ix = (field.params[:, 1] / field.dx).round().long().clamp(0, velocity.shape[1] - 1)
             min_log_width = (velocity.detach()[iz, ix] / (4 * frequency)).clamp_min(field.dx).log()
             field.params[:, 2:4] = torch.maximum(field.params[:, 2:4], min_log_width[:, None])
-    print(f"Gaussians: {frequency:g} Hz, {len(field)} atoms, loss {loss:.3e}")
+    print(f"Gaussians: {frequency:g} Hz, {len(field)} atoms, last pre-update loss {loss:.3e}")
     return losses
